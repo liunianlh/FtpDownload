@@ -1,193 +1,345 @@
 #!/usr/bin/env python3
-import ftplib
+"""从 FTP 服务器批量下载文件并打包为 ZIP。
+
+关键设计：把 FTP 连接的 encoding 设为 "latin-1"（单字节、1:1 可逆），
+这样无论服务器文件名原始编码是 GBK 还是 UTF-8，都能安全地拿到原始
+字节串再在本地按多编码猜测用于显示，同时 RETR 时又能把字符串 1:1
+还原成服务器期望的字节，避免了为不同编码反复重连 FTP。
+"""
+from __future__ import annotations
+
+import argparse
+import logging
 import os
-import sys
-import zipfile
 import shutil
+import sys
+import time
+import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from ftplib import FTP, all_errors
+from pathlib import Path
+from typing import Iterable, Iterator
 
-# FTP连接信息
-FTP_HOST = "124.71.204.53"
-FTP_USER = "huameisftp"
-FTP_PASS = "huameisftp*&78"
-LOCAL_DIR = "/Users/heloveyy/Desktop"
-FOLDER_NAME = "大都会"
-ZIP_NAME = "大都会.zip"
+# ---------- 默认配置（可被环境变量 / 命令行参数覆盖） ----------
+DEFAULTS = {
+    "FTP_HOST": "124.71.204.53",
+    "FTP_USER": "huameisftp",
+    "FTP_PASS": "huameisftp*&78",
+    "LOCAL_DIR": str(Path.home() / "Desktop"),
+    "FOLDER_NAME": "大都会",
+    "ZIP_NAME": "大都会.zip",
+}
 
-def decode_filename(raw_bytes, encodings=['gbk', 'gb18030', 'gb2312', 'utf-8', 'latin1']):
-    """尝试多种编码解码文件名"""
-    for encoding in encodings:
+DISPLAY_ENCODINGS: tuple[str, ...] = ("gbk", "gb18030", "utf-8")
+WIRE_ENCODING = "latin-1"  # FTP 连接编码，保证字节 1:1 可逆
+MAX_RETRIES = 3
+RETRY_BACKOFF_SEC = 2.0
+
+log = logging.getLogger("ftp_download")
+
+
+# ---------- 数据结构 ----------
+@dataclass(frozen=True)
+class RemoteFile:
+    wire_name: str        # 用 latin-1 解码得到的“线路名”，可直接回传给 FTP
+    display_name: str     # 给人看的名字（尽量按 GBK/UTF-8 解码成可读中文）
+    size: int
+
+
+# ---------- 工具函数 ----------
+def decode_for_display(raw: bytes) -> str:
+    """尽量按常见中文编码解码，仅用于控制台显示和本地文件名。"""
+    for enc in DISPLAY_ENCODINGS:
         try:
-            decoded = raw_bytes.decode(encoding)
-            # 检查是否包含有效的中文字符或其他有效字符
-            if len(decoded) > 0 and not all(ord(c) < 32 for c in decoded if c != '\n' and c != '\r'):
-                return decoded, encoding
-        except (UnicodeDecodeError, LookupError):
+            return raw.decode(enc)
+        except UnicodeDecodeError:
             continue
-    return raw_bytes.decode('utf-8', errors='ignore'), 'utf-8-ignore'
+    return raw.decode("utf-8", errors="replace")
 
-def parse_ftp_list(raw_data):
-    """解析FTP LIST命令返回的原始数据，提取文件信息"""
-    files = []
-    lines = raw_data.split(b'\r\n')
 
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith(b'total'):
-            continue
+def parse_list_line(line: bytes) -> RemoteFile | None:
+    """解析一行 UNIX 风格 LIST 输出。返回 None 表示忽略此行。"""
+    line = line.strip()
+    if not line or line.startswith(b"total"):
+        return None
 
-        # 解析文件列表行（格式：权限 链接数 所有者 组 大小 日期 时间 文件名）
-        parts = line.split()
-        if len(parts) < 9:
-            continue
+    parts = line.split(maxsplit=8)
+    if len(parts) < 9:
+        return None
 
-        # 提取文件大小和原始文件名
-        try:
-            size = int(parts[4])
-            # 文件名是从第9部分开始（可能有空格）
-            filename_raw = b' '.join(parts[8:])
+    perm = parts[0]
+    if perm.startswith(b"d") or perm.startswith(b"l"):
+        return None  # 跳过目录和符号链接
 
-            # 尝试解码文件名
-            filename_decoded, encoding = decode_filename(filename_raw)
-            filename_decoded = filename_decoded.strip()
+    try:
+        size = int(parts[4])
+    except ValueError:
+        return None
 
-            # 排除目录
-            if filename_decoded not in ['.', '..']:
-                files.append({
-                    'filename': filename_decoded,
-                    'filename_raw': filename_raw,
-                    'size': size,
-                    'encoding': encoding
-                })
-        except Exception as e:
-            print(f"解析文件行失败: {line}, 错误: {e}")
-            continue
+    name_raw = parts[8].rstrip(b"\r\n")
+    if name_raw in (b".", b".."):
+        return None
 
+    return RemoteFile(
+        wire_name=name_raw.decode(WIRE_ENCODING),
+        display_name=decode_for_display(name_raw).strip(),
+        size=size,
+    )
+
+
+def parse_ftp_list(raw: bytes) -> list[RemoteFile]:
+    files: list[RemoteFile] = []
+    for line in raw.split(b"\r\n"):
+        item = parse_list_line(line)
+        if item is not None:
+            files.append(item)
     return files
 
-def download_and_package_ftp_files():
-    """连接到FTP服务器，下载所有文件，并打包压缩"""
+
+def human_size(n: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:,.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{n} B"
+
+
+# ---------- FTP 交互 ----------
+@contextmanager
+def ftp_connection(host: str, user: str, password: str) -> Iterator[FTP]:
+    ftp = FTP()
+    ftp.encoding = WIRE_ENCODING
+    ftp.connect(host, timeout=30)
     try:
-        # 创建目标文件夹
-        target_folder = os.path.join(LOCAL_DIR, FOLDER_NAME)
-        if os.path.exists(target_folder):
-            print(f"文件夹 '{FOLDER_NAME}' 已存在，清空内容...")
-            shutil.rmtree(target_folder)
-        os.makedirs(target_folder, exist_ok=True)
-        print(f"创建文件夹: {target_folder}")
-        
-        # 连接到FTP服务器
-        print(f"正在连接到FTP服务器 {FTP_HOST}...")
-        ftp = ftplib.FTP()
-        ftp.encoding = 'gbk'  # 设置默认编码为GBK
-        ftp.connect(FTP_HOST)
-        ftp.login(FTP_USER, FTP_PASS)
-        print("连接成功！")
+        ftp.login(user, password)
+        yield ftp
+    finally:
+        try:
+            ftp.quit()
+        except all_errors:
+            ftp.close()
 
-        # 获取文件列表（使用二进制模式获取，避免编码问题）
-        print("获取文件列表...")
 
-        # 使用 LIST 命令的原始二进制数据
-        data = []
-        ftp.retrbinary('LIST', data.append)
-        raw_list = b''.join(data)
+def list_remote_files(ftp: FTP) -> list[RemoteFile]:
+    chunks: list[bytes] = []
+    ftp.retrbinary("LIST", chunks.append)
+    return parse_ftp_list(b"".join(chunks))
 
-        # 解析文件列表
-        files_info = parse_ftp_list(raw_list)
 
-        print(f"找到 {len(files_info)} 个文件:")
-        for file_info in files_info:
-            print(f"  - {file_info['filename']} ({file_info['size']} 字节) [{file_info['encoding']}]")
+class ProgressWriter:
+    """包装文件句柄，在 write 时输出单行刷新的进度条。
 
-        # 下载每个文件到目标文件夹
-        downloaded_files = []
-        for file_info in files_info:
-            filename_local = file_info['filename']
-            encoding = file_info['encoding']
-            local_path = os.path.join(target_folder, filename_local)
+    仅在 TTY 下启用回车刷新；非交互场景（被重定向/日志文件）下
+    退化为“只在显著百分比变化时打印一行”，避免刷屏。
+    """
 
-            print(f"正在下载: {filename_local} ({file_info['size']} 字节)")
+    def __init__(self, fp, total: int, label: str) -> None:
+        self._fp = fp
+        self._total = max(total, 0)
+        self._label = label
+        self._written = 0
+        self._last_emit = 0.0
+        self._last_pct = -1
+        self._is_tty = sys.stdout.isatty()
 
+    def write(self, data: bytes) -> int:
+        n = self._fp.write(data)
+        self._written += len(data)
+        self._maybe_emit(final=False)
+        return n
+
+    def _maybe_emit(self, final: bool) -> None:
+        now = time.monotonic()
+        pct = int(self._written * 100 / self._total) if self._total > 0 else 0
+        if self._is_tty:
+            if final or now - self._last_emit > 0.2:
+                self._emit_tty(pct)
+                self._last_emit = now
+        else:
+            # 非 TTY：每 10% 或完成时打印一次
+            if final or pct >= self._last_pct + 10:
+                self._emit_plain(pct)
+                self._last_pct = pct
+
+    def _emit_tty(self, pct: int) -> None:
+        if self._total > 0:
+            msg = (
+                f"  ↳ {self._label}: {human_size(self._written)}"
+                f" / {human_size(self._total)} ({pct:3d}%)"
+            )
+        else:
+            msg = f"  ↳ {self._label}: {human_size(self._written)}"
+        sys.stdout.write("\r" + msg.ljust(80))
+        sys.stdout.flush()
+
+    def _emit_plain(self, pct: int) -> None:
+        if self._total > 0:
+            log.info(
+                "  ↳ %s: %s / %s (%d%%)",
+                self._label, human_size(self._written), human_size(self._total), pct,
+            )
+        else:
+            log.info("  ↳ %s: %s", self._label, human_size(self._written))
+
+    def finish(self) -> None:
+        self._maybe_emit(final=True)
+        if self._is_tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
+def download_file(ftp: FTP, remote: RemoteFile, local_path: Path) -> None:
+    tmp_path = local_path.with_suffix(local_path.suffix + ".part")
+    with open(tmp_path, "wb") as fp:
+        writer = ProgressWriter(fp, remote.size, remote.display_name)
+        try:
+            ftp.retrbinary(f"RETR {remote.wire_name}", writer.write)
+        finally:
+            writer.finish()
+    tmp_path.replace(local_path)
+
+
+def download_with_retry(
+    connect_args: tuple[str, str, str],
+    ftp: FTP,
+    remote: RemoteFile,
+    local_path: Path,
+) -> FTP:
+    """下载单个文件，失败时重试。必要时重建连接后返回新的 FTP 句柄。"""
+    host, user, pwd = connect_args
+    last_err: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            download_file(ftp, remote, local_path)
+            return ftp
+        except all_errors as err:
+            last_err = err
+            log.warning(
+                "下载 %s 失败（第 %d/%d 次）：%s",
+                remote.display_name, attempt, MAX_RETRIES, err,
+            )
             try:
-                with open(local_path, 'wb') as f:
-                    # 对于GBK编码的文件，使用当前的GBK连接
-                    if encoding == 'gbk':
-                        ftp.retrbinary(f'RETR {filename_local}', f.write)
-                        downloaded_files.append(local_path)
-                        print(f"  下载完成: {filename_local}")
-                    else:
-                        # 对于UTF-8编码的文件，重新建立连接
-                        print(f"  检测到UTF-8编码，重新建立连接...")
-                        ftp.close()
+                ftp.close()
+            except all_errors:
+                pass
+            if attempt == MAX_RETRIES:
+                break
+            time.sleep(RETRY_BACKOFF_SEC * attempt)
+            ftp = FTP()
+            ftp.encoding = WIRE_ENCODING
+            ftp.connect(host, timeout=30)
+            ftp.login(user, pwd)
+    raise RuntimeError(f"重试 {MAX_RETRIES} 次仍无法下载：{remote.display_name}") from last_err
 
-                        ftp_utf8 = ftplib.FTP()
-                        ftp_utf8.encoding = 'utf-8'
-                        ftp_utf8.connect(FTP_HOST)
-                        ftp_utf8.login(FTP_USER, FTP_PASS)
-                        ftp_utf8.retrbinary(f'RETR {filename_local}', f.write)
-                        ftp_utf8.close()
 
-                        # 重新建立GBK连接以便后续文件
-                        ftp = ftplib.FTP()
-                        ftp.encoding = 'gbk'
-                        ftp.connect(FTP_HOST)
-                        ftp.login(FTP_USER, FTP_PASS)
+# ---------- 打包 ----------
+def create_zip(src_dir: Path, zip_path: Path, base_dir: Path) -> int:
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as zipf:
+        for file_path in sorted(src_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            arcname = file_path.relative_to(base_dir)
+            zipf.write(file_path, arcname)
+            log.info("  + %s", arcname)
+    return zip_path.stat().st_size
 
-                        downloaded_files.append(local_path)
-                        print(f"  下载完成: {filename_local}")
-            except Exception as e:
-                print(f"  下载失败 {filename_local}: {e}")
 
-        # 关闭FTP连接
-        ftp.quit()
-        print("所有文件下载完成！")
-
-        # 验证下载的文件
-        print("\n下载的文件列表:")
-        total_size = 0
-        for file_info in files_info:
-            filename = file_info['filename']
-            local_path = os.path.join(target_folder, filename)
-            if os.path.exists(local_path):
-                size = os.path.getsize(local_path)
-                total_size += size
-                print(f"  - {filename} ({size} 字节)")
-            else:
-                print(f"  - {filename} (未找到)")
-        
-        print(f"总大小: {total_size} 字节")
-        
-        # 创建ZIP压缩文件
-        print(f"\n正在创建压缩文件: {ZIP_NAME}")
-        zip_path = os.path.join(LOCAL_DIR, ZIP_NAME)
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(target_folder):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    # 在ZIP文件中保持相对路径
-                    arcname = os.path.relpath(file_path, LOCAL_DIR)
-                    zipf.write(file_path, arcname)
-                    print(f"  添加: {arcname}")
-        
-        zip_size = os.path.getsize(zip_path)
-        print(f"压缩文件创建完成: {zip_path} ({zip_size} 字节)")
-        
-        # 清理：删除临时文件夹（可选）
-        print(f"\n清理临时文件夹: {target_folder}")
+# ---------- 主流程 ----------
+def run(
+    host: str,
+    user: str,
+    password: str,
+    local_dir: Path,
+    folder_name: str,
+    zip_name: str,
+    keep_folder: bool,
+) -> None:
+    target_folder = local_dir / folder_name
+    if target_folder.exists():
+        log.info("清空已存在的目录：%s", target_folder)
         shutil.rmtree(target_folder)
-        print("临时文件夹已删除")
-        
-        # 最终结果
-        print(f"\n✅ 任务完成！")
-        print(f"   从FTP服务器下载了 {len(files_info)} 个文件")
-        print(f"   创建了压缩文件: {ZIP_NAME} ({zip_size} 字节)")
-        print(f"   文件位置: {zip_path}")
-        
-    except Exception as e:
-        print(f"错误: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    target_folder.mkdir(parents=True, exist_ok=True)
+    log.info("创建目录：%s", target_folder)
+
+    log.info("连接 FTP %s ...", host)
+    with ftp_connection(host, user, password) as ftp:
+        log.info("登录成功，拉取文件列表...")
+        files = list_remote_files(ftp)
+        if not files:
+            log.warning("远程目录为空，什么都没下载。")
+            return
+
+        total_remote = sum(f.size for f in files)
+        log.info("共 %d 个文件，合计 %s", len(files), human_size(total_remote))
+
+        connect_args = (host, user, password)
+        for idx, remote in enumerate(files, 1):
+            log.info(
+                "[%d/%d] %s (%s)",
+                idx, len(files), remote.display_name, human_size(remote.size),
+            )
+            local_path = target_folder / remote.display_name
+            ftp = download_with_retry(connect_args, ftp, remote, local_path)
+
+    total_local = sum(p.stat().st_size for p in target_folder.rglob("*") if p.is_file())
+    log.info("下载完成，本地总大小 %s", human_size(total_local))
+
+    zip_path = local_dir / zip_name
+    log.info("打包 ZIP：%s", zip_path)
+    zip_size = create_zip(target_folder, zip_path, local_dir)
+    log.info("ZIP 创建完成：%s（%s）", zip_path, human_size(zip_size))
+
+    if not keep_folder:
+        shutil.rmtree(target_folder)
+        log.info("已清理临时目录：%s", target_folder)
+
+    log.info("✅ 任务完成：共 %d 个文件 → %s", len(files), zip_path)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="从 FTP 下载文件并打包为 ZIP")
+    p.add_argument("--host", default=os.environ.get("FTP_HOST", DEFAULTS["FTP_HOST"]))
+    p.add_argument("--user", default=os.environ.get("FTP_USER", DEFAULTS["FTP_USER"]))
+    p.add_argument("--password", default=os.environ.get("FTP_PASS", DEFAULTS["FTP_PASS"]))
+    p.add_argument("--local-dir", default=os.environ.get("FTP_LOCAL_DIR", DEFAULTS["LOCAL_DIR"]))
+    p.add_argument("--folder-name", default=os.environ.get("FTP_FOLDER_NAME", DEFAULTS["FOLDER_NAME"]))
+    p.add_argument("--zip-name", default=os.environ.get("FTP_ZIP_NAME", DEFAULTS["ZIP_NAME"]))
+    p.add_argument("--keep-folder", action="store_true", help="打包后保留下载目录")
+    p.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
+    return p
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+    )
+    try:
+        run(
+            host=args.host,
+            user=args.user,
+            password=args.password,
+            local_dir=Path(args.local_dir).expanduser(),
+            folder_name=args.folder_name,
+            zip_name=args.zip_name,
+            keep_folder=args.keep_folder,
+        )
+    except KeyboardInterrupt:
+        log.error("用户中断。")
+        return 130
+    except Exception as err:  # noqa: BLE001 — 顶层兜底
+        log.error("任务失败：%s", err)
+        if args.verbose:
+            log.exception("详细堆栈：")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    download_and_package_ftp_files()
+    sys.exit(main())
