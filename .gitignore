@@ -1,0 +1,12 @@
+# Python virtual environment (do not commit)
+ftp_download_env/
+
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.env
+.env.*
+!.env.example
+
+.DS_Store
