@@ -1,0 +1,13 @@
+{
+  "ftp": {
+    "host": "your-ftp-host",
+    "user": "your-ftp-user",
+    "password": "your-ftp-password",
+    "encoding": "gbk"
+  },
+  "download": {
+    "local_dir": "/Users/yourname/Desktop",
+    "folder_name": "download_folder_name",
+    "zip_name": "download_folder_name.zip"
+  }
+}

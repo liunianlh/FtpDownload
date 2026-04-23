@@ -10,3 +10,5 @@ __pycache__/
 !.env.example
 
 .DS_Store
+ftp_config.json
+ftp_config.local.json
