@@ -1,101 +1,122 @@
 # FTP Download Tools
 
-一个用于从 FTP 服务器批量下载文件并自动打包为 ZIP 的小工具，适配 macOS 使用场景。
+从 FTP 服务器批量下载当前目录下的文件，打包为 ZIP，并在完成后清理临时文件夹。面向 macOS，兼顾中文文件名与常见 FTP 编码（如 GBK）。
 
 ## 功能概览
 
-- 连接 FTP 服务器并读取目录文件列表
-- 兼容中文文件名编码（优先尝试 `gbk` / `gb18030` / `utf-8` 等）
-- 按文件逐个下载到本地临时目录
-- 自动压缩为 `大都会.zip`
-- 压缩完成后自动清理临时下载目录
-- 支持脚本运行与 macOS 双击运行
+- 通过 JSON 配置文件管理 FTP 账号与输出路径（无需改 Python 源码）
+- 兼容中文文件名：对 `LIST` 结果按多种编码尝试解码（`gbk` / `gb18030` / `gb2312` / `utf-8` 等）
+- 逐个下载到本地临时目录，再压缩为 ZIP
+- 压缩完成后删除临时下载目录
+- 支持终端运行与 macOS 双击运行（`.command`）
 
 ## 目录结构
 
 ```text
-ftp_download_tools/
-├── download_ftp_files.py      # 主程序：下载 + 压缩 + 清理
-├── run_ftp_download.sh        # 终端运行脚本（激活虚拟环境后执行）
-└── ftp_download_env/          # Python 虚拟环境目录
+FtpDownload/
+├── README.md
+├── 大都会下载.command          # 仓库根目录：双击运行（激活 venv 后执行 Python 脚本）
+└── ftp_download_tools/
+    ├── download_ftp_files.py   # 主程序：读配置、下载、打包、清理
+    ├── ftp_config.example.json # 配置示例（可复制后改名填写）
+    ├── ftp_config.local.json   # 本地配置（推荐；已被 .gitignore 忽略）
+    ├── ftp_download_env/       # Python 虚拟环境（勿提交）
+    └── run_ftp_download.sh     # 可选：终端包装脚本（若内含固定绝对路径，请按本机路径修改）
 ```
-
-仓库根目录还有：
-
-- `大都会下载.command`：macOS 双击运行入口（适合非命令行用户）
 
 ## 运行环境
 
 - macOS
 - Python 3.8+
-- 可访问目标 FTP 服务器的网络环境
+- 可访问目标 FTP 的网络环境
 
-该项目主要依赖 Python 标准库（`ftplib`、`zipfile`、`shutil` 等），一般不需要额外安装第三方包。
+仅使用标准库（`ftplib`、`zipfile`、`json`、`shutil` 等），一般无需安装第三方包。
+
+## 配置说明
+
+程序按以下顺序查找配置文件：
+
+1. 环境变量 `FTP_CONFIG_FILE` 指向的单个文件（若设置）
+2. 否则在 `ftp_download_tools/` 下依次尝试：`ftp_config.local.json` → `ftp_config.json`
+
+建议复制示例文件并填写敏感信息：
+
+```bash
+cd ftp_download_tools
+cp ftp_config.example.json ftp_config.local.json
+# 编辑 ftp_config.local.json，填写 host、user、password 与 download 路径等
+```
+
+`ftp` 段常用字段：
+
+| 字段 | 说明 |
+|------|------|
+| `host` | FTP 主机 |
+| `user` / `password` | 登录凭据 |
+| `encoding` | 连接编码，默认 `gbk`（可按服务器调整） |
+
+`download` 段必填字段：
+
+| 字段 | 说明 |
+|------|------|
+| `local_dir` | ZIP 与临时目录的父路径（例如桌面路径） |
+| `folder_name` | 临时下载文件夹名（下载完成后会删除） |
+| `zip_name` | 输出的 ZIP 文件名（含 `.zip` 后缀） |
 
 ## 快速开始
 
 ### 1) 创建虚拟环境（首次）
 
-在仓库根目录执行：
-
-```bash
-python3 -m venv ftp_download_tools/ftp_download_env
-```
-
-### 2) 运行方式
-
-#### 方式 A：终端执行
+在仓库中执行：
 
 ```bash
 cd ftp_download_tools
-./run_ftp_download.sh
+python3 -m venv ftp_download_env
 ```
 
-#### 方式 B：双击执行（macOS）
+### 2) 准备配置
+
+按上一节创建并编辑 `ftp_config.local.json`。
+
+### 3) 运行
+
+**方式 A：双击（macOS）**
 
 在 Finder 中双击仓库根目录下的 `大都会下载.command`。
 
+**方式 B：终端**
+
+```bash
+cd ftp_download_tools
+source ftp_download_env/bin/activate
+python3 download_ftp_files.py
+deactivate
+```
+
 ## 输出结果
 
-脚本执行成功后会在桌面生成：
+成功执行后，ZIP 会出现在配置里 `local_dir` 与 `zip_name` 所指定的位置；临时目录为 `local_dir` 下的 `folder_name`，打包完成后会被删除。
 
-- `大都会.zip`
+## 代码逻辑简述
 
-流程中会临时创建下载目录（默认 `~/Desktop/大都会`），压缩完成后自动删除临时目录。
+`download_and_package_ftp_files()` 大致流程：
 
-## 主要配置（在 `download_ftp_files.py` 顶部）
-
-- `FTP_HOST`：FTP 主机地址
-- `FTP_USER`：FTP 用户名
-- `FTP_PASS`：FTP 密码
-- `LOCAL_DIR`：本地输出目录（默认桌面）
-- `FOLDER_NAME`：临时下载目录名
-- `ZIP_NAME`：输出压缩包文件名
-
-如需迁移到其他环境，优先修改上述常量即可。
-
-## 代码逻辑说明
-
-`download_and_package_ftp_files()` 主流程：
-
-1. 初始化并清理本地临时目录
-2. 连接 FTP（默认按 `gbk` 编码）
-3. 使用 `LIST` 原始二进制结果解析文件列表
-4. 多编码尝试解码文件名，确保中文文件可读
-5. 下载所有文件（必要时用 UTF-8 连接重试）
-6. 校验下载结果并统计总大小
-7. 打包压缩为 ZIP
-8. 删除临时目录并输出最终结果
+1. 加载 JSON 配置并校验必填字段  
+2. 清空并重建本地临时目录  
+3. 连接 FTP（使用配置中的 `encoding`）  
+4. 用 `LIST` 的原始字节解析文件列表并解码文件名  
+5. 逐个下载（必要时对 UTF-8 文件名切换连接编码）  
+6. 校验本地文件与总大小  
+7. 写入 ZIP 后删除临时目录  
 
 ## 注意事项
 
-- 当前脚本将 FTP 凭据明文写在代码中，仅建议在受控内网或个人环境中使用。
-- 如果计划共享仓库，建议改为环境变量读取账号密码，避免泄露敏感信息。
-- 若 FTP 目录包含子目录，当前实现主要按“文件列表”下载；如需递归下载，可在后续版本扩展。
+- 凭据放在 `ftp_config.local.json` 等本地文件中，勿将含密码的文件提交到公开仓库。  
+- 当前逻辑主要针对 FTP **当前目录下的文件**；子目录递归下载需自行扩展。  
+- 若文件名仍乱码，可在 `decode_filename()` 中调整编码尝试顺序。
 
 ## 常见问题
 
-- **虚拟环境不存在**：先执行创建命令 `python3 -m venv ftp_download_tools/ftp_download_env`
-- **连接失败**：确认 FTP 地址、账号密码、网络白名单与防火墙策略
-- **文件名乱码**：可在 `decode_filename()` 里调整编码尝试顺序
-
+- **提示未找到配置文件**：确认已创建 `ftp_config.local.json` 或 `ftp_config.json`，或设置 `FTP_CONFIG_FILE`。  
+- **虚拟环境不存在**：在 `ftp_download_tools` 下执行 `python3 -m venv ftp_download_env`。  
+- **连接失败**：检查主机、账号密码、网络与白名单/防火墙。  
